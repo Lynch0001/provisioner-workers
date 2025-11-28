@@ -1,0 +1,15 @@
+version: "3.9"
+
+services:
+  provisioner-worker:
+    build:
+      context: ./
+      dockerfile: Dockerfile
+    command: >
+      celery -A workers.infrastructure worker --loglevel=INFO
+    environment:
+      CELERY_BROKER_URL: amqp://user:pass@rabbitmq:5672//
+      CELERY_RESULT_BACKEND: db+postgresql://postgres:password@localhost:5432/provisioner
+      PYTHONPATH: /workers
+    volumes:
+      - ./:/workers:rw
