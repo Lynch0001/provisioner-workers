@@ -16,7 +16,7 @@ def finalize_workflow(self, prior: dict | None = None, **kwargs):
 
    # TODO will never show failed (Complete vs Success)
     with engine.begin() as conn:
-        exp = expected_steps(wid)
+        exp = expected_steps(conn,wid)
         print("##################: Expected Steps {} steps".format(exp))
         done = count_steps(wid, statuses=("success","failed"))
         print("##################: Done {} steps".format(done))

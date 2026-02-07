@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 GIT_BRANCH_PREFIX = "auto/create-core-project-"
 
-SKIP_ATLANTIS_TASKS = True
+SKIP_ATLANTIS_TASKS = False
 
 @shared_task(bind=True, name="workers.tasks.create.create_core_project", queue="core_project")
 @track_step

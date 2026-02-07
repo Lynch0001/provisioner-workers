@@ -10,11 +10,17 @@ from pathlib import Path
 from typing import Optional, Mapping, Iterable
 
 from git import Repo, GitCommandError  # pip install GitPython
+from pydantic.v1.validators import constant_validator
 
 from workers.config.logging_config import setup_logging
 
 setup_logging()
 logger = logging.getLogger(__name__)
+
+TOMBSTONE_CONTENT = '''terraform {
+  source = "../../../modules/null"
+}
+'''
 
 @dataclass(frozen=True)
 class GitRepoSpec:
@@ -161,12 +167,7 @@ class GitHandler:
             text = text.replace(old, new)
         fp.write_text(text)
 
-    def replace_tokens_in_tree(
-        self,
-        root_rel: str | Path,
-        replacements: Mapping[str, str],
-        file_globs: Iterable[str] = ("*.hcl","*.tf","*.tfvars","*.yaml","*.yml","*.json"),
-    ) -> int:
+    def replace_tokens_in_tree(self,root_rel: str | Path,replacements: Mapping[str, str],file_globs: Iterable[str] = ("*.hcl","*.tf","*.tfvars","*.yaml","*.yml","*.json"),) -> int:
         base = self.root / root_rel
         if not base.exists():
             raise FileNotFoundError(f"Tree root not found: {base}")
@@ -182,6 +183,43 @@ class GitHandler:
                     changed += 1
         return changed
 
+    def checkout_existing_branch(self, repo_root: Path, branch_name, remote: str = "origin"):
+        log_output = True # Debugging only/Requires debug logging be enabled in logging config
+
+        _shell_git_run(["git", "remote", "-v"], cwd=repo_root,log_stdout=log_output,log_prefix="[git remote]")
+
+        _shell_git_run(["git", "fetch", "--prune", remote, branch_name], cwd=repo_root,log_stdout=log_output,log_prefix="[git fetch]")
+
+        _shell_git_run(["git", "rev-parse", "--verify", "FETCH_HEAD"], cwd=repo_root,log_stdout=log_output,log_prefix="[git rev-parse]")
+
+        _shell_git_run(["git", "checkout", "-B", branch_name, "FETCH_HEAD"], cwd=repo_root,log_stdout=log_output,log_prefix="[git checkout]")
+
+        logger.info("[git] checked out branch %s", branch_name)
+
+        self.branch_name = branch_name
+
+def _shell_git_run(cmd: list[str],cwd: Path,*,log_stdout: bool = False,log_prefix: str = "[git]",) -> None:
+    logger.debug("%s running: %s", log_prefix, " ".join(cmd))
+
+    p = subprocess.run(
+        cmd,
+        cwd=str(cwd),
+        capture_output=True,
+        text=True,
+    )
+
+    if log_stdout and p.stdout.strip():
+        logger.debug("%s stdout:\n%s", log_prefix, p.stdout.strip())
+
+    if p.stderr.strip():
+        logger.debug("%s stderr:\n%s", log_prefix, p.stderr.strip())
+
+    if p.returncode != 0:
+        raise RuntimeError(
+            f"Command failed: {' '.join(cmd)}\n"
+            f"stdout={p.stdout}\n"
+            f"stderr={p.stderr}"
+        )
 
 def _ensure_under_repo(repo_root: Path, target: Path):
     repo_root = repo_root.resolve()
@@ -201,23 +239,31 @@ def _on_rm_error(func, path, exc_info):
 def safe_delete_path(repo_root: Path, relative_path: str) -> dict:
     """
     Delete a path (file or dir) inside the git repo working tree and stage the change.
-    Works whether files are tracked or untracked.
+    Handles:
+      - tracked paths (git rm)
+      - untracked/ignored leftovers (filesystem delete + git add -A)
 
-    Returns a dict with details for logging.
+    Returns dict:
+      {
+        "path": "...",
+        "changed": bool,   # whether repo has any changes after deletion attempt
+        "deleted": bool,   # whether the path is gone from the filesystem
+        "via": "git_rm|git_rm+fs_rm|fs_rm",
+        "status": "<porcelain output (maybe empty)>"
+      }
     """
     repo_root = Path(repo_root).resolve()
     rel = Path(relative_path)
     abs_target = (repo_root / rel).resolve()
+    logger.info("[delete] abs target: %s", abs_target)
 
-    # 1) Safety: never delete outside repo
     _ensure_under_repo(repo_root, abs_target)
 
-    # 2) If nothing to delete, that's not an error — just log and move on
     if not abs_target.exists():
         logger.info("[delete] nothing to delete: %s", rel.as_posix())
-        return {"deleted": False, "reason": "not_found", "path": rel.as_posix()}
+        return {"path": rel.as_posix(), "changed": False, "deleted": False, "via": "not_found", "status": ""}
 
-    # 3) Try `git rm -r --ignore-unmatch` first (handles tracked files & stages the deletion)
+    via = None
     try:
         subprocess.run(
             ["git", "rm", "-r", "--ignore-unmatch", rel.as_posix()],
@@ -225,26 +271,106 @@ def safe_delete_path(repo_root: Path, relative_path: str) -> dict:
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            text=True,
         )
-        deleted_via = "git_rm"
+        via = "git_rm"
     except subprocess.CalledProcessError as e:
-        logger.debug("[delete] git rm failed for %s: %s", rel.as_posix(), e)
-        # 4) Fallback: filesystem delete (untracked files / directories), then stage all changes
-        if abs_target.is_dir():
-            shutil.rmtree(abs_target, onerror=_on_rm_error)
-        else:
-            try:
-                os.chmod(abs_target, stat.S_IWRITE)
-            except Exception:
-                pass
-            os.remove(abs_target)
-        # Stage deletions
-        subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True)
-        deleted_via = "fs_rm+git_add"
+        logger.warning("[delete] git rm failed for %s: %s", rel.as_posix(), e.stderr or e)
+        via = "fs_rm"
 
-    # 5) Verify gone
-    still_exists = abs_target.exists()
-    if still_exists:
+    if abs_target.exists():
+        try:
+            if abs_target.is_dir():
+                shutil.rmtree(abs_target, onerror=_on_rm_error)
+            else:
+                try:
+                    os.chmod(abs_target, stat.S_IWRITE)
+                except Exception:
+                    pass
+                abs_target.unlink()
+            via = "git_rm+fs_rm" if via == "git_rm" else "fs_rm"
+        except Exception as e:
+            raise RuntimeError(f"Failed filesystem delete for {rel.as_posix()}: {e}") from e
+
+    subprocess.run(["git", "add", "-A"], cwd=str(repo_root), check=True)
+
+    p = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=str(repo_root),
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    status_out = p.stdout.strip()
+    changed = bool(status_out)
+
+    deleted = not abs_target.exists()
+    logger.info("[delete] deleted=%s changed=%s via=%s path=%s", deleted, changed, via, rel.as_posix())
+    if status_out:
+        logger.info("[delete] porcelain:\n%s", status_out)
+
+    if not deleted:
         raise RuntimeError(f"Failed to delete path: {rel.as_posix()}")
 
-    return {"deleted": True, "path": rel.as_posix(), "via": deleted_via}
+    return {
+        "path": rel.as_posix(),
+        "changed": changed,
+        "deleted": deleted,
+        "via": via,
+        "status": status_out,
+    }
+
+def tombstone_path(
+    repo_root: Path,
+    relative_path: str,
+    *,
+    extensions: Iterable[str] = (".hcl",),
+    recursive: bool = True,
+    require_matches: bool = True,
+) -> List[str]:
+    """
+    Replace a file OR all matching files in a directory with TOMBSTONE_CONTENT.
+
+    Returns a list of repo-relative paths that were modified (content actually changed).
+    """
+    repo_root = Path(repo_root).resolve()
+    target = (repo_root / relative_path).resolve()
+
+    if repo_root not in target.parents and target != repo_root:
+        raise RuntimeError(f"Refusing to edit outside repo: {target}")
+
+    if not target.exists():
+        raise FileNotFoundError(f"Path not found: {target}")
+
+    new_content = TOMBSTONE_CONTENT.rstrip() + "\n"
+
+    def _write_if_changed(p: Path) -> bool:
+        existing = p.read_text(encoding="utf-8") if p.exists() else ""
+        if existing == new_content:
+            return False
+        p.write_text(new_content, encoding="utf-8")
+        return True
+
+    changed: List[str] = []
+
+    if target.is_file():
+        if _write_if_changed(target):
+            changed.append(str(target.relative_to(repo_root)))
+        return changed
+
+    if not target.is_dir():
+        raise RuntimeError(f"Not a file or directory: {target}")
+
+    exts = tuple(extensions)
+
+    paths = target.rglob("*") if recursive else target.iterdir()
+    for p in paths:
+        if p.is_file() and p.suffix in exts:
+            if _write_if_changed(p):
+                changed.append(str(p.relative_to(repo_root)))
+
+    if require_matches and not changed:
+        raise RuntimeError(f"No matching files changed under {relative_path} (extensions={exts})")
+
+    return changed

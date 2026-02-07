@@ -144,4 +144,14 @@ celery.conf.task_routes = {
     "workers.tasks.create.finalize_workflow": {"queue": "provisioner"},
 
     # TODO Add Destroy tasks - reorder in orchestrator workflow -> destroy, delete, verify
+    # Core-Project
+    "workers.tasks.destroy.tombstone_core_project": {"queue": "core"},
+    "workers.tasks.destroy.delete_core_project": {"queue": "core"},
+    "workers.tasks.destroy.create_core_project_mr": {"queue": "core"},
+    "workers.tasks.destroy.core_project_wait_atlantis_plan": {"queue": "core"},
+    "workers.tasks.destroy.deploy_core_project": {"queue": "core"},
+    "workers.tasks.destroy.core_project_wait_atlantis_apply": {"queue": "core"},
+    "workers.tasks.destroy.verify_core_project": {"queue": "core"},
+    "workers.tasks.destroy.merge_core_project_mr": {"queue": "core"},
+
 }

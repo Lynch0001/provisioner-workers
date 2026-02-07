@@ -11,7 +11,7 @@ AWS_PROFILE = os.getenv("AWS_PROFILE", "default")
 
 # --- Git/GitLab ---
 GITLAB_BASE_URL = os.getenv("GITLAB_BASE_URL", "https://gitlab.com")
-GITLAB_TOKEN = os.getenv("GITLAB_TOKEN", "")
+GITLAB_TOKEN = os.getenv("GITLAB_TOKEN", "glpat-VKkhQ0OUk6R1jvAwKIi9ZG86MQp1OjJzZDdnCw.01.120bwrd0c")
 GITLAB_INFR_PROJECT_ID = os.getenv("GITLAB_INFR_PROJECT_ID", "71208092") # number
 GITLAB_HELM_PROJECT_ID = os.getenv("GITLAB_HELM_PROJECT_ID", "74187819") # number
 

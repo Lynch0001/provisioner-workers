@@ -14,7 +14,7 @@ from workers.database.db_wrapper import track_step
 from workers.handlers.atlantis_handler import post_atlantis_apply_comment
 from workers.handlers.atlantis_wait_handler import _now, _deadline, _find_latest_atlantis_note, _is_transient_http, \
     _parse_plan_status, _parse_apply_status, _sleep_secs, _pick_atlantis_note_text
-from workers.handlers.git_handler import GitRepoSpec, GitHandler, safe_delete_path
+from workers.handlers.git_handler import GitRepoSpec, GitHandler, safe_delete_path, tombstone_path
 from workers.handlers.gitlab_mr_handler import get_gl_project, get_or_create_mr
 from workers.handlers.merge_handler import merge_branch
 
@@ -29,11 +29,69 @@ GIT_BRANCH_PREFIX = "auto/destroy-core-project-"
 SKIP_ATLANTIS_TASKS = True
 SKIP_DESTROY_TASKS = True
 
+TOMBSTONE_CONTENT = '''terraform {
+  source = "../../../modules/null"
+}
+'''
+
 @shared_task(bind=True, name="workers.tasks.destroy.delete_core_project", queue="core")
 @track_step
 def delete_core_project(self, prior:dict, **kwargs):
-    # Observe what Celery actually delivered
-    logger.debug("[delete_core_project] args=%r kwargs=%r", self.request.args, self.request.kwargs)
+    logger.info("[%s] args=%r kwargs=%r", self.name, self.request.args, self.request.kwargs)
+    # normalize: tolerate kwargs/project_id dicts if needed
+    project_id = prior["project_id"]
+    mr_iid = prior["mr_iid"]
+    if project_id is None:
+        project_id = kwargs.get("project_id") or (kwargs.get("art") or {}).get("project_id")
+    if not project_id or not isinstance(project_id, str):
+        raise self.retry(countdown=60, exc=RuntimeError("Missing or invalid project_id"))
+    spec = GitRepoSpec(
+        repo_url=GIT_INFR_REPO_URL,
+        base_branch=GIT_INFR_BASE_BRANCH,
+        branch_prefix=GIT_BRANCH_PREFIX,
+    )
+    gl = gitlab.Gitlab(GITLAB_BASE_URL, private_token=GITLAB_TOKEN, api_version=4, timeout=20)
+    gl.session.headers.update(
+        {"User-Agent": "provisioner-workers/1.0 (+https://example.com)"})  # TODO update with provisioner host
+    project = gl.projects.get(GITLAB_INFR_PROJECT_ID, lazy=True)  # no fetch yet
+    mr = project.mergerequests.get(mr_iid)
+    branch_name = mr.source_branch
+    logger.info("[delete_core_project] branch=%s", branch_name)
+    try:
+        with GitHandler(spec, project_id) as gh:
+            gh.init_repo()
+            repo_root = Path(gh.repo.working_tree_dir).resolve()
+            logger.info("[delete_core_project] repo_root=%s", repo_root)
+            gh.checkout_existing_branch(repo_root, branch_name)
+            relative_path = f"{INFR_BASE_PATH_DEMO}/projects/{project_id}"
+            logger.info("[delete_core_project] relative_path=%s", relative_path)
+            changed = safe_delete_path(repo_root, relative_path)
+            logger.info("[delete_core_project] changed=%s", changed)
+            if changed:
+                gh.commit_and_push(f"Delete core_project for {project_id}")
+            else:
+                logger.info("[delete_core_project] nothing to delete; no staged changes")
+
+            return {
+                "project_id": project_id,
+                "workflow_id": prior["workflow_id"],
+                "branch_name": branch_name,
+                "branch_exists": False,
+                "note": f"[delete:core_project] started with {branch_name}"
+            }
+    except CeleryRetry:
+        raise
+    except (OSError, RuntimeError) as e:
+        raise self.retry(countdown=60, exc=e)
+    except Exception as e:
+        raise self.retry(countdown=60, exc=RuntimeError(f"Unexpected error: {e}"))
+
+
+
+@shared_task(bind=True, name="workers.tasks.destroy.tombstone_core_project", queue="core")
+@track_step
+def tombstone_core_project(self, prior:dict, **kwargs):
+    logger.info("[%s] args=%r kwargs=%r", self.name, self.request.args, self.request.kwargs)
     # normalize: tolerate kwargs/project_id dicts if needed
     project_id = prior["project_id"]
     if project_id is None:
@@ -51,29 +109,17 @@ def delete_core_project(self, prior:dict, **kwargs):
             branch_name_template = f"{GIT_BRANCH_PREFIX}{project_id}"
             branch_name = gh.create_branch(explicit_name=branch_name_template)
             logger.info("[delete_core_project] created branch %s", branch_name)
-
             repo_root = Path(gh.repo.working_tree_dir).resolve()
-
             # project terragrunt.hcl
-            rel_path = f"{INFR_BASE_PATH_DEMO}/projects/{project_id}"
-            info = safe_delete_path(repo_root, rel_path)
-            logger.info("[delete_core_project] delete info: %s", info)
-
-            # # project project.hcl
-            rel_path = f"{INFR_BASE_PATH_DEMO}/{project_id}"
-            info = safe_delete_path(repo_root, rel_path)
-            logger.info("[delete_core_project] delete info: %s", info)
-
-            # If nothing changed (path not found and no staged changes), short-circuit
-            # But still push a branch if you want a "no-op" MR to track the intent — your call.
-            # We'll only commit when there are staged changes:
-            #   git diff --cached --quiet exits 1 when there are staged changes.
-            rc = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=str(repo_root)).returncode
+            relative_path = f"{INFR_BASE_PATH_DEMO}/projects/{project_id}/terragrunt.hcl"
+            changed = tombstone_path(repo_root, relative_path)
+            logger.info("[tombstone_core_project] changed=%s path=%s", changed, relative_path)
+            subprocess.run(["git", "add", relative_path], cwd=str(repo_root), check=True)
+            rc = subprocess.run(["git", "diff", "--quiet"], cwd=str(repo_root)).returncode
             if rc != 0:
-                gh.commit_and_push(f"Delete core_project for {project_id}")
+                gh.commit_and_push(f"Tombstone core_project for {project_id}")
             else:
-                logger.info("[delete_core_project] no staged changes; skipping commit/push")
-
+                logger.info("[tombstone_core_project] no staged changes; skipping commit/push")
             return {
                 "project_id": project_id,
                 "workflow_id": prior["workflow_id"],
@@ -89,10 +135,12 @@ def delete_core_project(self, prior:dict, **kwargs):
         raise self.retry(countdown=60, exc=RuntimeError(f"Unexpected error: {e}"))
 
 
+
+
 @shared_task(bind=True, name="workers.tasks.destroy.create_core_project_mr", queue="core_project")
 @track_step
 def create_core_project_mr(self, prior:dict, **kwargs):
-    logger.debug("[create_core_project] args=%r kwargs=%r", self.request.args, self.request.kwargs)
+    logger.info("[%s] args=%r kwargs=%r", self.name, self.request.args, self.request.kwargs)
     if not isinstance(prior, dict):
         raise ValueError(f"{self.name} expected dict prior, got {type(prior).__name__}: {prior!r}")
     project_id = prior.get("project_id")
@@ -266,7 +314,7 @@ def verify_core_project(self, prior: dict):
              retry_jitter=True, retry_kwargs={"max_retries": 6})
 @track_step
 def merge_core_project_mr(self, prior:dict, **kwargs):
-    logger.debug("[merge_core_project] args=%r kwargs=%r", self.request.args, self.request.kwargs)
+    logger.info("[%s] args=%r kwargs=%r", self.name, self.request.args, self.request.kwargs)
 
     project_id = prior.get("project_id")
     workflow_id = prior.get("workflow_id")
